@@ -1,6 +1,7 @@
 import cv2
 import numpy as np
 from datetime import datetime
+from functools import lru_cache
 
 class FrameDiffDetector:
     def __init__(self, threshold=30, min_area_percentage=1, noise_reduction=0, 
@@ -23,12 +24,32 @@ class FrameDiffDetector:
         self.previous_frame = None
         self.motion_history = np.array([])
         
+        # Cache for expensive operations
+        self._clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8,8))
+        self._kernel_cache = {}
+        self._zone_masks = {}
+        
+    @lru_cache(maxsize=8)
+    def _get_blur_kernel(self, noise_reduction):
+        """Get cached Gaussian blur kernel"""
+        size = 2 * noise_reduction + 1
+        return (size, size), noise_reduction
+    
+    def _get_zone_mask(self, shape, zone):
+        """Get cached zone mask"""
+        key = (shape[0], shape[1], *zone)
+        if key not in self._zone_masks:
+            mask = np.zeros(shape, dtype=np.uint8)
+            x, y, w, h = zone
+            mask[y:y+h, x:x+w] = 1
+            self._zone_masks[key] = mask
+        return self._zone_masks[key]
+    
     def apply_noise_reduction(self, frame):
         """Apply noise reduction to frame"""
         if self.noise_reduction > 0:
-            return cv2.GaussianBlur(frame, 
-                                  (2 * self.noise_reduction + 1, 2 * self.noise_reduction + 1), 
-                                  self.noise_reduction)
+            kernel = self._get_blur_kernel(self.noise_reduction)
+            return cv2.GaussianBlur(frame, *kernel)
         return frame
     
     def apply_light_compensation(self, frame):
@@ -36,8 +57,7 @@ class FrameDiffDetector:
         if self.light_compensation:
             lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
             l, a, b = cv2.split(lab)
-            clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8,8))
-            cl = clahe.apply(l)
+            cl = self._clahe.apply(l)
             return cv2.cvtColor(cv2.merge((cl,a,b)), cv2.COLOR_LAB2BGR)
         return frame
     
@@ -46,18 +66,21 @@ class FrameDiffDetector:
         if not contours or len(self.motion_history) < 2:
             return "None"
         
-        # Calculate centroid of all contours
-        current_center = np.mean([np.mean(c, axis=0) for c in contours], axis=0)
+        # Calculate centroid of all contours using numpy operations
+        points = np.vstack([c.reshape(-1, 2) for c in contours])
+        current_center = np.mean(points, axis=0)
         
         if len(self.motion_history) > 0:
             prev_center = self.motion_history[-1]
             dx = current_center[0] - prev_center[0]
             dy = current_center[1] - prev_center[1]
             
-            # Update motion history
-            self.motion_history = np.vstack([self.motion_history, current_center])
-            if len(self.motion_history) > 10:  # Keep last 10 positions
-                self.motion_history = self.motion_history[-10:]
+            # Update motion history efficiently
+            if len(self.motion_history) >= 10:
+                self.motion_history = np.roll(self.motion_history, -1, axis=0)
+                self.motion_history[-1] = current_center
+            else:
+                self.motion_history = np.vstack([self.motion_history, current_center])
             
             # Determine direction
             angle = np.arctan2(dy, dx) * 180 / np.pi
@@ -83,11 +106,13 @@ class FrameDiffDetector:
             tuple: (difference_score, is_different, diff_frame, motion_info)
         """
         # Apply preprocessing
-        current_frame = self.apply_light_compensation(current_frame)
+        if self.light_compensation:
+            current_frame = self.apply_light_compensation(current_frame)
         
-        # Convert frame to grayscale
+        # Convert frame to grayscale and apply noise reduction
         gray = cv2.cvtColor(current_frame, cv2.COLOR_BGR2GRAY)
-        gray = self.apply_noise_reduction(gray)
+        if self.noise_reduction > 0:
+            gray = self.apply_noise_reduction(gray)
         
         # Initialize if this is the first frame
         if self.previous_frame is None:
@@ -100,48 +125,56 @@ class FrameDiffDetector:
         # Apply threshold to get binary image
         _, thresh = cv2.threshold(frame_diff, self.threshold, 255, cv2.THRESH_BINARY)
         
-        # Find contours in the thresholded image
-        contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        
-        # Initialize visualization frame
-        diff_frame = current_frame.copy()
-        
-        # Process detection zones
+        # Process detection zones efficiently
         zone_results = []
         if self.detection_zones:
-            for i, (x, y, w, h) in enumerate(self.detection_zones):
-                zone_mask = np.zeros_like(thresh)
-                zone_mask[y:y+h, x:x+w] = 1
-                zone_thresh = thresh * zone_mask
-                zone_diff_percentage = (np.count_nonzero(zone_thresh) / (w * h)) * 100
+            for i, zone in enumerate(self.detection_zones):
+                mask = self._get_zone_mask(thresh.shape, zone)
+                zone_thresh = thresh * mask
+                zone_diff_percentage = (np.count_nonzero(zone_thresh) / (zone[2] * zone[3])) * 100
                 zone_results.append({
                     'zone_id': i,
                     'diff_percentage': zone_diff_percentage,
                     'is_active': zone_diff_percentage > self.min_area_percentage
                 })
-                # Draw zone rectangle
-                color = (0, 0, 255) if zone_diff_percentage > self.min_area_percentage else (0, 255, 0)
-                cv2.rectangle(diff_frame, (x, y), (x+w, y+h), color, 2)
         
         # Calculate overall difference percentage
         diff_percentage = (np.count_nonzero(thresh) / thresh.size) * 100
         is_different = diff_percentage > self.min_area_percentage
         
-        # Draw motion tracking
+        # Only process contours if needed
         motion_direction = "None"
-        if contours and is_different:
-            # Draw bounding boxes
-            for contour in contours:
-                if cv2.contourArea(contour) > 100:  # Filter small contours
+        if is_different:
+            # Find contours in the thresholded image
+            contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            
+            # Filter small contours efficiently
+            contours = [cnt for cnt in contours if cv2.contourArea(cnt) > 100]
+            
+            if contours:
+                motion_direction = self.detect_motion_direction(contours)
+        else:
+            contours = []
+        
+        # Create visualization only if needed
+        diff_frame = current_frame.copy()
+        
+        # Draw zones and motion tracking efficiently
+        if self.detection_zones or (contours and is_different):
+            # Draw zones
+            for i, (x, y, w, h) in enumerate(self.detection_zones):
+                color = (0, 0, 255) if zone_results[i]['is_active'] else (0, 255, 0)
+                cv2.rectangle(diff_frame, (x, y), (x+w, y+h), color, 2)
+            
+            # Draw motion tracking
+            if contours and is_different:
+                for contour in contours:
                     x, y, w, h = cv2.boundingRect(contour)
                     cv2.rectangle(diff_frame, (x, y), (x+w, y+h), (255, 0, 0), 2)
-            
-            # Detect motion direction
-            motion_direction = self.detect_motion_direction(contours)
-            
-            # Draw motion direction
-            cv2.putText(diff_frame, f"Motion: {motion_direction}", (10, 30),
-                       cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+                
+                if motion_direction != "None":
+                    cv2.putText(diff_frame, f"Motion: {motion_direction}", (10, 30),
+                              cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
         
         # Create motion information dictionary
         motion_info = {
@@ -151,9 +184,10 @@ class FrameDiffDetector:
             'timestamp': datetime.now()
         }
         
-        # Overlay difference mask
-        diff_mask = cv2.cvtColor(thresh, cv2.COLOR_GRAY2BGR)
-        cv2.addWeighted(diff_frame, 1, diff_mask, 0.3, 0, diff_frame)
+        # Overlay difference mask efficiently
+        if self.show_diff_overlay:
+            diff_mask = cv2.cvtColor(thresh, cv2.COLOR_GRAY2BGR)
+            cv2.addWeighted(diff_frame, 1, diff_mask, 0.3, 0, diff_frame)
         
         # Update previous frame
         self.previous_frame = gray
@@ -163,10 +197,13 @@ class FrameDiffDetector:
     def add_detection_zone(self, x, y, w, h):
         """Add a new detection zone"""
         self.detection_zones.append((x, y, w, h))
+        # Clear zone mask cache
+        self._zone_masks.clear()
     
     def clear_detection_zones(self):
         """Remove all detection zones"""
         self.detection_zones = []
+        self._zone_masks.clear()
     
     def set_sensitivity_preset(self, preset):
         """Set detection sensitivity preset"""

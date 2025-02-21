@@ -11,6 +11,7 @@ import os
 import json
 from pathlib import Path
 import time
+import concurrent.futures
 
 class SliderWithValue(ttk.Frame):
     """Custom slider widget with value display and tooltip"""
@@ -63,6 +64,18 @@ class FrameDiffGUI:
         # Thread safety
         self.gui_update_lock = threading.Lock()
         self.frame_update_lock = threading.Lock()
+        self.processing_lock = threading.Lock()
+        
+        # Processing queues
+        self.frame_queue = queue.Queue(maxsize=10)  # Raw frame queue
+        self.result_queue = queue.Queue(maxsize=2)  # Processed frame queue
+        
+        # Thread pools
+        self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=3)
+        self.processing_threads = []
+        
+        # Processing state
+        self.processing_active = False
         
         # Load or create default settings
         self.settings = self.load_settings()
@@ -82,7 +95,6 @@ class FrameDiffGUI:
         self.update_interval = tk.IntVar(value=self.settings['update_interval'])
         
         self.is_running = False
-        self.queue = queue.Queue(maxsize=2)  # Limit queue size for better performance
         self.session_start_time = None
         
         # Add new variables
@@ -548,6 +560,7 @@ class FrameDiffGUI:
             )
             
             self.is_running = True
+            self.processing_active = True
             self.start_button.config(text="Stop Camera")
             self.update_status_label("status", "Status: Running", "green")
             
@@ -555,10 +568,17 @@ class FrameDiffGUI:
             self.error_count = 0
             self.last_error_time = None
             
-            # Start video thread
-            self.video_thread = threading.Thread(target=self.update_frame)
+            # Start frame capture thread
+            self.video_thread = threading.Thread(target=self.capture_frames)
             self.video_thread.daemon = True
             self.video_thread.start()
+            
+            # Start processing threads
+            for _ in range(2):  # Create 2 processing threads
+                thread = threading.Thread(target=self.process_frames)
+                thread.daemon = True
+                thread.start()
+                self.processing_threads.append(thread)
             
             # Start GUI update
             self.update_gui()
@@ -568,119 +588,163 @@ class FrameDiffGUI:
             self.stop_camera()
     
     def stop_camera(self):
+        self.processing_active = False
+        self.is_running = False
+        
+        # Clear queues
+        self.clear_queues()
+        
+        if self.cap is not None:
+            self.cap.release()
+        
         # Stop recording if active
         if self.recording:
             self.toggle_recording()
         
-        self.is_running = False
-        if self.cap is not None:
-            self.cap.release()
         self.start_button.config(text="Start Camera")
         self.update_status_label("status", "Status: Stopped")
         
-        # Clear queue
-        while not self.queue.empty():
-            try:
-                self.queue.get_nowait()
-            except queue.Empty:
-                break
+        # Wait for processing threads to finish
+        for thread in self.processing_threads:
+            thread.join(timeout=1.0)
+        self.processing_threads.clear()
     
-    def update_frame(self):
+    def clear_queues(self):
+        """Clear all queues safely"""
+        for q in [self.frame_queue, self.result_queue]:
+            while not q.empty():
+                try:
+                    q.get_nowait()
+                except queue.Empty:
+                    break
+    
+    def capture_frames(self):
+        """Thread for capturing frames from the camera"""
+        frame_drop_count = 0
+        last_frame_time = time.time()
+        
         while self.is_running:
             try:
                 if not self.cap or not self.cap.isOpened():
                     self.handle_camera_error("Camera disconnected")
                     break
-
+                
                 ret, frame = self.cap.read()
                 if not ret:
                     if self.camera_source.get() == "Video File":
-                        self.stop_camera()  # End of video file
+                        self.stop_camera()
                         break
                     self.handle_camera_error("Failed to read frame")
                     continue
-
-                with self.frame_update_lock:
+                
+                # Calculate FPS and frame timing
+                current_time = time.time()
+                frame_time = current_time - last_frame_time
+                target_frame_time = 1.0 / 30.0  # Target 30 FPS
+                
+                # If we're processing too slowly, drop frames
+                if frame_time < target_frame_time and not self.frame_queue.empty():
+                    frame_drop_count += 1
+                    if frame_drop_count % 30 == 0:  # Log every 30 drops
+                        print(f"Dropped {frame_drop_count} frames due to processing lag")
+                    continue
+                
+                # Try to add frame to queue
+                try:
+                    self.frame_queue.put_nowait(frame)
+                    last_frame_time = current_time
+                except queue.Full:
+                    frame_drop_count += 1
+                    continue
+                
+            except Exception as e:
+                self.handle_camera_error(f"Frame capture error: {str(e)}")
+                continue
+            
+            time.sleep(0.001)  # Small delay to prevent CPU overload
+    
+    def process_frames(self):
+        """Worker thread for processing frames"""
+        while self.processing_active:
+            try:
+                # Get frame from queue with timeout
+                frame = self.frame_queue.get(timeout=0.1)
+                
+                with self.processing_lock:
                     # Resize frame if needed
                     if frame.shape[1] != self.frame_width.get() or frame.shape[0] != self.frame_height.get():
-                        try:
-                            frame = cv2.resize(frame, (self.frame_width.get(), self.frame_height.get()))
-                        except Exception as e:
-                            self.handle_camera_error(f"Resize error: {str(e)}")
-                            continue
-
+                        frame = cv2.resize(frame, (self.frame_width.get(), self.frame_height.get()))
+                    
                     # Update detector parameters
                     if self.detector:
                         self.detector.threshold = int(self.threshold.get())
                         self.detector.min_area_percentage = self.min_area.get()
                         self.detector.noise_reduction = self.noise_reduction.get()
                         self.detector.light_compensation = self.light_compensation.get()
-
+                        
                         # Process frame
-                        try:
-                            diff_score, is_different, diff_frame, motion_info = self.detector.compute_frame_difference(frame)
-                        except Exception as e:
-                            self.handle_camera_error(f"Detection error: {str(e)}")
-                            continue
-
-                        # Save frames if enabled and different
+                        diff_score, is_different, diff_frame, motion_info = self.detector.compute_frame_difference(frame)
+                        
+                        # Handle frame saving and recording in separate thread
                         if is_different and self.save_frames.get():
-                            try:
-                                if self.save_original.get():
-                                    cv2.imwrite(self.get_save_path("original"), frame)
-                                if self.save_diff.get():
-                                    cv2.imwrite(self.get_save_path("diff"), diff_frame)
-                                self.frames_saved += 1
-                                self.update_status_label("frames", f"Frames Saved: {self.frames_saved}")
-                            except Exception as e:
-                                self.handle_camera_error(f"Save error: {str(e)}")
-
-                        # Save video if recording
+                            self.executor.submit(self.save_frame_data, frame, diff_frame)
+                        
                         if self.recording and self.video_writer:
-                            try:
-                                self.video_writer.write(frame)
-                            except Exception as e:
-                                self.handle_camera_error(f"Recording error: {str(e)}")
-                                self.toggle_recording()  # Stop recording on error
-
-                        # Draw current zone if drawing
-                        if self.is_drawing_zone and self.current_zone:
-                            x, y, w, h = self.current_zone
-                            cv2.rectangle(diff_frame, (x, y), (x+w, y+h), (255, 255, 0), 2)
-
+                            self.executor.submit(self.write_video_frame, frame)
+                        
                         # Update display
                         display_frame = diff_frame if self.show_diff_overlay.get() else frame
                         display_frame = cv2.cvtColor(display_frame, cv2.COLOR_BGR2RGB)
-
-                        # Show motion direction if available
+                        
+                        # Add motion direction
                         if motion_info and isinstance(motion_info, dict) and motion_info.get('direction'):
                             direction = motion_info['direction']
                             if direction != "None":
                                 cv2.putText(display_frame, f"Motion: {direction}", 
                                           (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-
-                        # Update queue
+                        
+                        # Update result queue
                         try:
-                            self.queue.put_nowait((display_frame, diff_score, is_different))
+                            self.result_queue.put_nowait((display_frame, diff_score, is_different))
                         except queue.Full:
                             try:
-                                self.queue.get_nowait()
-                                self.queue.put_nowait((display_frame, diff_score, is_different))
+                                self.result_queue.get_nowait()
+                                self.result_queue.put_nowait((display_frame, diff_score, is_different))
                             except queue.Empty:
                                 pass
-
-            except Exception as e:
-                self.handle_camera_error(f"Unexpected error: {str(e)}")
+                
+            except queue.Empty:
                 continue
-
-            # Add small delay to prevent CPU overload
-            time.sleep(0.001)
+            except Exception as e:
+                self.handle_camera_error(f"Frame processing error: {str(e)}")
+                continue
+    
+    def save_frame_data(self, frame, diff_frame):
+        """Save frame data in a separate thread"""
+        try:
+            if self.save_original.get():
+                cv2.imwrite(self.get_save_path("original"), frame)
+            if self.save_diff.get():
+                cv2.imwrite(self.get_save_path("diff"), diff_frame)
+            self.frames_saved += 1
+            self.update_status_label("frames", f"Frames Saved: {self.frames_saved}")
+        except Exception as e:
+            self.handle_camera_error(f"Save error: {str(e)}")
+    
+    def write_video_frame(self, frame):
+        """Write video frame in a separate thread"""
+        try:
+            if self.video_writer:
+                self.video_writer.write(frame)
+        except Exception as e:
+            self.handle_camera_error(f"Recording error: {str(e)}")
+            self.toggle_recording()
 
     def update_gui(self):
         try:
             with self.gui_update_lock:
                 # Get the latest frame
-                display_frame, diff_score, is_different = self.queue.get_nowait()
+                display_frame, diff_score, is_different = self.result_queue.get_nowait()
                 
                 # Update FPS calculation
                 current_time = datetime.now()
